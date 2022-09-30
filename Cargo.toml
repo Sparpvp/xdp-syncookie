@@ -1,0 +1,23 @@
+[package]
+name = "xdp-syncookie"
+version = "0.1.0"
+edition = '2018'
+
+[dependencies]
+cty = "0.2"
+redbpf-macros = { git = "https://github.com/foniod/redbpf" }
+redbpf-probes = { git = "https://github.com/foniod/redbpf" }
+
+[build-dependencies]
+cargo-bpf = { version = "2.3.0", default-features = false }
+
+[features]
+default = ["probes"]
+probes = []
+
+[[bin]]
+name = "pfilter"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["probes"]
