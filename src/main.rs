@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::convert::TryFrom;
-
+use core::hash::{Hash, Hasher, SipHasher};
 use redbpf_probes::xdp::prelude::*;
 
 program!(0xFFFFFFFE, "GPL");
@@ -28,7 +28,7 @@ impl Transport {
 
     fn process_syn(
         &self,
-        ctx: &XdpContext,
+        // ctx: &XdpContext,
         ip_proto: &IPProtocol,
         eth_h: *mut ethhdr, // eth_h is retrievable with ctx
     ) -> XdpResult {
@@ -74,20 +74,88 @@ impl Transport {
         Ok(XdpAction::Tx)
     }
 
-    fn process_ack(&self, ctx: &XdpContext) -> XdpResult {
+    fn process_ack(&self) -> XdpResult {
         todo!()
     }
 
-    fn handle_tcp(&self, ctx: &XdpContext, ip_proto: &IPProtocol, eth_h: *mut ethhdr) -> XdpResult {
+    fn handle_tcp(&self, ip_proto: &IPProtocol, eth_h: *mut ethhdr) -> XdpResult {
         let syn = self.is_syn();
         printk!("Syn: %u", syn as u32).unwrap();
 
         match syn {
-            true => self.process_syn(&ctx, &ip_proto, eth_h),
-            false if self.is_ack() == true => self.process_ack(&ctx),
+            true => self.process_syn(&ip_proto, eth_h),
+            false if self.is_ack() == true => self.process_ack(),
             _ => Ok(XdpAction::Pass),
         }
     }
+}
+
+#[derive(Hash)]
+struct Cookie {
+    server_ip: u32,
+    client_ip: u32,
+    server_port: u16,
+    client_port: u16,
+    timestamp: u8,
+}
+
+/*
+    Syn Cookie Model:
+    - 8 bits timestamp t
+    - 24 bits checksum s
+
+    MSS is ignored in my implementation since the networking stack will ignore it.
+*/
+struct TCPSequence {
+    timestamp: u8,
+    //mss: u8,
+    checksum: u64,
+}
+
+impl TCPSequence {
+    fn build_tcp_sequence(&self) -> u32 {
+        let mut tcp_seq: u32 = 0;
+        tcp_seq = (tcp_seq << 8) | self.timestamp as u32;
+        tcp_seq = (tcp_seq << 24) | (self.checksum >> 32) as u32;
+
+        tcp_seq
+    }
+}
+
+fn generate_syn_cookie(ip_proto: &IPProtocol, tcph: *const tcphdr) -> u32 {
+    const NS_TO_S: u64 = 1000000000;
+
+    let mut tcp_seq: u32 = 0;
+    let t = ((bpf_ktime_get_ns() / NS_TO_S) >> 6) as u8;
+    //printk!("timestamp 64s resolution: %u", t);
+    let (source_addr, dest_addr) = match *ip_proto {
+        IPProtocol::IPv4(ipv4h) => unsafe { ((*ipv4h).saddr, (*ipv4h).daddr) },
+        IPProtocol::IPv6(ipv6h) => unsafe {
+            // ((*ipv6h).saddr, (*ipv6h).daddr) // different type...
+            todo!()
+        },
+    };
+    let (source_port, dest_port) = unsafe { ((*tcph).source, (*tcph).dest) };
+
+    let mut hasher = SipHasher::new(); // Todo: use better hasher
+    let cookie = Cookie {
+        server_ip: source_addr,
+        server_port: source_port,
+        client_ip: dest_addr,
+        client_port: dest_port,
+        timestamp: t,
+    };
+    cookie.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let tcp_sequence = TCPSequence {
+        timestamp: t,
+        checksum: hash,
+    };
+    let tcp_sequence = tcp_sequence.build_tcp_sequence();
+    printk!("TCP Sequence: %u", tcp_sequence);
+
+    tcp_sequence
 }
 
 enum IPProtocol {
@@ -126,7 +194,7 @@ impl TryFrom<&XdpContext> for IPProtocol {
         let eth_ipv4 = u16::from_be(ETH_P_IP as u16);
         let eth_ipv6 = u16::from_be(ETH_P_IPV6 as u16);
 
-        printk!("Got EtherType: 0x%x %x", ethertype, eth_ipv4).unwrap();
+        //printk!("[DBG] Got EtherType: 0x%x %x", ethertype, eth_ipv4).unwrap();
 
         // Get pointer to next header
         // let network_layer = (eth as usize) + size_of::<ethhdr>(); // redbpf fix ur trash
@@ -177,8 +245,14 @@ pub fn xdp_main(ctx: XdpContext) -> XdpResult {
 
     let tcp = ip_proto.tcp(&ctx)?;
 
-    let eth = ctx.eth()? as *mut ethhdr;
-    let xdpaction = tcp.handle_tcp(&ctx, &ip_proto, eth);
+    // Should i lookup listener socket?
 
-    return xdpaction;
+    let eth = ctx.eth()? as *mut ethhdr;
+
+    todo!();
+    //let xdpaction = tcp.handle_tcp(&ip_proto, eth);
+    //let sequence = generate_syn_cookie(&ip_proto, tcp.0);
+
+    //return xdpaction;
+    //Ok(XdpAction::Pass)
 }
