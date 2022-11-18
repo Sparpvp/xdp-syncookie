@@ -7,6 +7,21 @@ use redbpf_probes::xdp::prelude::*;
 
 program!(0xFFFFFFFE, "GPL");
 
+const NS_TO_S: u64 = 1000000000;
+
+fn get_hash<T: Hash>(to_hash: T) -> u64 {
+    let mut hasher = SipHasher::new();
+    to_hash.hash(&mut hasher);
+    let hash = hasher.finish();
+    hash
+}
+
+// TODO: Use this to support IPv4 AND IPv6 address in match operation (unaccepted due to different types)
+// enum Address {
+//     IPv4Addr(u32),
+//     IPv6Addr(in6_addr),
+// }
+
 struct Transport(*mut tcphdr);
 
 impl Transport {
@@ -18,23 +33,16 @@ impl Transport {
         unsafe { *self.0 }.ack() == 1
     }
 
-    fn set_tcpseq(&mut self, tcpseq: u32) {
-        unsafe { *self.0 }.ack_seq = tcpseq
-    }
-
-    fn get_tcpseq(&self) -> u32 {
-        unsafe { *self.0 }.seq
-    }
-
-    fn process_syn(
-        &self,
-        // ctx: &XdpContext,
-        ip_proto: &IPProtocol,
-        eth_h: *mut ethhdr, // eth_h is retrievable with ctx
-    ) -> XdpResult {
+    fn process_syn(&self, ip_proto: &IPProtocol, eth_h: *mut ethhdr) -> XdpResult {
         let tcph = self.0;
 
         unsafe {
+            // Send SYN Cookie in SYN-ACK
+            let cookie = Cookie::generate_syn_cookie(&ip_proto, tcph);
+            (*tcph).ack_seq = (*tcph).seq + 1;
+            (*tcph).seq = cookie;
+            (*tcph).set_ack(1);
+
             // Reverse TCP ports
             let temp_s_port = (*tcph).source;
             (*tcph).source = (*tcph).dest;
@@ -64,7 +72,6 @@ impl Transport {
             (*eth_h).h_dest = eth_h_source;
 
             /* TODO process_syn:
-                [x] Generate SYN Cookie
                 [x] Clear IP options
                 [x] Update IP checksum
                 [x] Update TCP checksum
@@ -74,24 +81,50 @@ impl Transport {
         Ok(XdpAction::Tx)
     }
 
-    fn process_ack(&self) -> XdpResult {
-        todo!()
+    fn process_ack(&self, ip_proto: &IPProtocol) -> XdpResult {
+        let tcph = self.0;
+
+        unsafe {
+            let received_cookie = ((*tcph).seq) - 1;
+            let (t, recv_hash) = Cookie::retrive_tcp_sequence(received_cookie);
+
+            // Recompute checksum
+            let (saddr, daddr) = match *ip_proto {
+                IPProtocol::IPv4(ipv4h) => ((*ipv4h).saddr, (*ipv4h).daddr),
+                IPProtocol::IPv6(ipv6h) => todo!(),
+            };
+            let checksum = CookieChecksum {
+                server_port: (*tcph).dest,
+                client_port: (*tcph).source,
+                timestamp: t,
+                server_ip: saddr,
+                client_ip: daddr,
+            };
+            let hash = get_hash(checksum);
+
+            let actual_timestamp = ((bpf_ktime_get_ns() / NS_TO_S) >> 6) as u8;
+            if (hash >> 32) as u32 == recv_hash && t == actual_timestamp {
+                return Ok(XdpAction::Pass);
+            } else {
+                return Ok(XdpAction::Drop);
+            }
+        }
     }
 
     fn handle_tcp(&self, ip_proto: &IPProtocol, eth_h: *mut ethhdr) -> XdpResult {
         let syn = self.is_syn();
-        printk!("Syn: %u", syn as u32).unwrap();
+        //printk!("Syn: %u", syn as u32).unwrap();
 
         match syn {
             true => self.process_syn(&ip_proto, eth_h),
-            false if self.is_ack() == true => self.process_ack(),
+            false if self.is_ack() == true => self.process_ack(&ip_proto),
             _ => Ok(XdpAction::Pass),
         }
     }
 }
 
 #[derive(Hash)]
-struct Cookie {
+struct CookieChecksum {
     server_ip: u32,
     client_ip: u32,
     server_port: u16,
@@ -100,19 +133,18 @@ struct Cookie {
 }
 
 /*
-    Syn Cookie Model:
+    SYN Cookie model:
     - 8 bits timestamp t
     - 24 bits checksum s
 
     MSS is ignored in my implementation since the networking stack will ignore it.
 */
-struct TCPSequence {
+struct Cookie {
     timestamp: u8,
-    //mss: u8,
     checksum: u64,
 }
 
-impl TCPSequence {
+impl Cookie {
     fn build_tcp_sequence(&self) -> u32 {
         let mut tcp_seq: u32 = 0;
         tcp_seq = (tcp_seq << 8) | self.timestamp as u32;
@@ -120,42 +152,45 @@ impl TCPSequence {
 
         tcp_seq
     }
-}
 
-fn generate_syn_cookie(ip_proto: &IPProtocol, tcph: *const tcphdr) -> u32 {
-    const NS_TO_S: u64 = 1000000000;
+    fn retrive_tcp_sequence(seq_num: u32) -> (u8, u32) {
+        let t = (seq_num & 0x1F) as u8;
+        let checksum = (seq_num >> 5) & 0xFFFFFF;
 
-    let mut tcp_seq: u32 = 0;
-    let t = ((bpf_ktime_get_ns() / NS_TO_S) >> 6) as u8;
-    //printk!("timestamp 64s resolution: %u", t);
-    let (source_addr, dest_addr) = match *ip_proto {
-        IPProtocol::IPv4(ipv4h) => unsafe { ((*ipv4h).saddr, (*ipv4h).daddr) },
-        IPProtocol::IPv6(ipv6h) => unsafe {
-            // ((*ipv6h).saddr, (*ipv6h).daddr) // different type...
-            todo!()
-        },
-    };
-    let (source_port, dest_port) = unsafe { ((*tcph).source, (*tcph).dest) };
+        (t, checksum)
+    }
 
-    let mut hasher = SipHasher::new(); // Todo: use better hasher
-    let cookie = Cookie {
-        server_ip: source_addr,
-        server_port: source_port,
-        client_ip: dest_addr,
-        client_port: dest_port,
-        timestamp: t,
-    };
-    cookie.hash(&mut hasher);
-    let hash = hasher.finish();
+    fn generate_syn_cookie(ip_proto: &IPProtocol, tcph: *const tcphdr) -> u32 {
+        let t = ((bpf_ktime_get_ns() / NS_TO_S) >> 6) as u8;
+        let (source_addr, dest_addr) = match *ip_proto {
+            IPProtocol::IPv4(ipv4h) => unsafe { ((*ipv4h).saddr, (*ipv4h).daddr) },
+            IPProtocol::IPv6(ipv6h) => unsafe {
+                // ((*ipv6h).saddr, (*ipv6h).daddr) // different type...
+                printk!("Unimplemented! IPv6");
+                todo!()
+            },
+        };
+        let (source_port, dest_port) = unsafe { ((*tcph).source, (*tcph).dest) };
 
-    let tcp_sequence = TCPSequence {
-        timestamp: t,
-        checksum: hash,
-    };
-    let tcp_sequence = tcp_sequence.build_tcp_sequence();
-    printk!("TCP Sequence: %u", tcp_sequence);
+        let cookie = CookieChecksum {
+            server_ip: source_addr,
+            server_port: source_port,
+            client_ip: dest_addr,
+            client_port: dest_port,
+            timestamp: t,
+        };
+        let hash = get_hash(cookie);
 
-    tcp_sequence
+        let tcp_sequence = Cookie {
+            timestamp: t,
+            checksum: hash,
+        };
+        let tcp_sequence = tcp_sequence.build_tcp_sequence(); // fits different types in determined number of bytes
+
+        //printk!("Generated TCP Sequence: %u", tcp_sequence);
+
+        tcp_sequence
+    }
 }
 
 enum IPProtocol {
@@ -210,49 +245,25 @@ impl TryFrom<&XdpContext> for IPProtocol {
 #[xdp]
 pub fn xdp_main(ctx: XdpContext) -> XdpResult {
     let ip_proto = IPProtocol::try_from(&ctx)?;
-
-    // Debuggy way:
-    // let is_syn = match ipproto {
-    //     Ok(ipproto @ IPProtocol::IPv4(_)) => {
-    //         let tcp = ipproto.tcp(&ctx);
-    //         let tcp = match tcp {
-    //             Ok(_) => tcp,
-    //             Err(e) => {
-    //                 printk!("Error in tcp function call");
-    //                 Err(e)
-    //             }
-    //         };
-
-    //         Ok(tcp?.is_syn())
-    //     }
-    //     Ok(ipproto @ IPProtocol::IPv6(_)) => {
-    //         let tcp = ipproto.tcp(&ctx);
-    //         let tcp = match tcp {
-    //             Ok(_) => tcp,
-    //             Err(e) => {
-    //                 printk!("Error in tcp function call");
-    //                 Err(e)
-    //             }
-    //         };
-
-    //         Ok(tcp?.is_syn())
-    //     }
-    //     Err(e) => {
-    //         printk!("No IP Header");
-    //         Err(e)
-    //     }
-    // };
-
     let tcp = ip_proto.tcp(&ctx)?;
-
-    // Should i lookup listener socket?
-
     let eth = ctx.eth()? as *mut ethhdr;
 
-    todo!();
-    //let xdpaction = tcp.handle_tcp(&ip_proto, eth);
-    //let sequence = generate_syn_cookie(&ip_proto, tcp.0);
+    let XdpState = tcp.handle_tcp(&ip_proto, eth);
 
-    //return xdpaction;
-    //Ok(XdpAction::Pass)
+    match &XdpState {
+        Ok(XdpAction::Pass) => {
+            printk!("Action: Pass");
+        }
+        Ok(XdpAction::Tx) => {
+            printk!("Action: TX");
+        }
+        Ok(XdpAction::Drop) => {
+            printk!("Action: Drop");
+        }
+        _ => {
+            unreachable!();
+        }
+    }
+
+    XdpState
 }
