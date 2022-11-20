@@ -10,10 +10,9 @@ program!(0xFFFFFFFE, "GPL");
 const NS_TO_S: u64 = 1000000000;
 
 fn get_hash<T: Hash>(to_hash: T) -> u64 {
-    let mut hasher = SipHasher::new();
+    let mut hasher = SipHasher::new(); // todo: use better hash
     to_hash.hash(&mut hasher);
-    let hash = hasher.finish();
-    hash
+    hasher.finish()
 }
 
 // TODO: Use this to support IPv4 AND IPv6 address in match operation (unaccepted due to different types)
