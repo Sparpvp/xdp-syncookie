@@ -9,10 +9,10 @@ program!(0xFFFFFFFE, "GPL");
 
 const NS_TO_S: u64 = 1000000000;
 
-fn get_hash<T: Hash>(to_hash: T) -> u64 {
+fn get_checksum<T: Hash>(to_hash: T) -> u32 {
     let mut hasher = SipHasher::new(); // todo: use better hash
     to_hash.hash(&mut hasher);
-    hasher.finish()
+    hasher.finish() as u32
 }
 
 // TODO: Use this to support IPv4 AND IPv6 address in match operation (unaccepted due to different types)
@@ -85,7 +85,9 @@ impl Transport {
 
         unsafe {
             let received_cookie = ((*tcph).seq) - 1;
+            printk!("Received sequence number: %u", received_cookie);
             let (t, recv_hash) = Cookie::retrive_tcp_sequence(received_cookie);
+            printk!("T: %u", t);
 
             // Recompute checksum
             let (saddr, daddr) = match *ip_proto {
@@ -93,16 +95,18 @@ impl Transport {
                 IPProtocol::IPv6(ipv6h) => todo!(),
             };
             let checksum = CookieChecksum {
-                server_port: (*tcph).dest,
-                client_port: (*tcph).source,
+                server_port: (*tcph).source,
+                client_port: (*tcph).dest,
                 timestamp: t,
                 server_ip: saddr,
                 client_ip: daddr,
             };
-            let hash = get_hash(checksum);
+            let checksum = get_checksum(checksum) / 520;
+
+            printk!("Hash recomputed: %u | TCP hash: %u", checksum, recv_hash);
 
             let actual_timestamp = ((bpf_ktime_get_ns() / NS_TO_S) >> 6) as u8;
-            if (hash >> 32) as u32 == recv_hash && t == actual_timestamp {
+            if checksum == recv_hash && t == actual_timestamp {
                 return Ok(XdpAction::Pass);
             } else {
                 return Ok(XdpAction::Drop);
@@ -140,21 +144,22 @@ struct CookieChecksum {
 */
 struct Cookie {
     timestamp: u8,
-    checksum: u64,
+    checksum: u32,
 }
 
 impl Cookie {
     fn build_tcp_sequence(&self) -> u32 {
         let mut tcp_seq: u32 = 0;
         tcp_seq = (tcp_seq << 8) | self.timestamp as u32;
-        tcp_seq = (tcp_seq << 24) | (self.checksum >> 32) as u32;
+        tcp_seq = (tcp_seq << 24) | (self.checksum / 520);
+        // Note: / 520 is just a rough estimate to fit the biggest u32 into a 24 bits, should improve this.
 
         tcp_seq
     }
 
     fn retrive_tcp_sequence(seq_num: u32) -> (u8, u32) {
-        let t = (seq_num & 0x1F) as u8;
-        let checksum = (seq_num >> 5) & 0xFFFFFF;
+        let t = ((seq_num >> 24) & 0xFF) as u8;
+        let checksum = seq_num & 0xFFFFFF;
 
         (t, checksum)
     }
@@ -171,22 +176,25 @@ impl Cookie {
         };
         let (source_port, dest_port) = unsafe { ((*tcph).source, (*tcph).dest) };
 
-        let cookie = CookieChecksum {
+        let csum = CookieChecksum {
             server_ip: source_addr,
             server_port: source_port,
             client_ip: dest_addr,
             client_port: dest_port,
             timestamp: t,
         };
-        let hash = get_hash(cookie);
+        let csum = get_checksum(csum);
 
         let tcp_sequence = Cookie {
             timestamp: t,
-            checksum: hash,
+            checksum: csum,
         };
         let tcp_sequence = tcp_sequence.build_tcp_sequence(); // fits different types in determined number of bytes
 
-        //printk!("Generated TCP Sequence: %u", tcp_sequence);
+        printk!("Generated TCP Sequence: %u", tcp_sequence);
+        //let (tt, cc) = Cookie::retrive_tcp_sequence(tcp_sequence);
+        //assert_eq!(csum / 520, cc); // PASS
+        //printk!("csum g: %u | csum got: %u", csum / 520, cc);
 
         tcp_sequence
     }
