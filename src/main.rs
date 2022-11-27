@@ -9,6 +9,7 @@ program!(0xFFFFFFFE, "GPL");
 
 const NS_TO_S: u64 = 1000000000;
 
+// Returns checksum with a 24 bits mask applied
 fn get_checksum<T: Hash>(to_hash: T) -> u32 {
     let mut hasher = SipHasher::new(); // todo: use better hash
     to_hash.hash(&mut hasher);
@@ -21,9 +22,9 @@ fn get_checksum<T: Hash>(to_hash: T) -> u32 {
 //     IPv6Addr(in6_addr),
 // }
 
-struct Transport(*mut tcphdr);
+struct TransportHeader(*mut tcphdr);
 
-impl Transport {
+impl TransportHeader {
     fn is_syn(&self) -> bool {
         unsafe { *self.0 }.syn() == 1
     }
@@ -208,13 +209,13 @@ impl Cookie {
             client_port: dest_port,
             timestamp: t,
         };
-        let csum = get_checksum(csum); // Return hash masked for 24 bits
+        let csum = get_checksum(csum); // Note: returned hash is masked for 24 bits
 
         let tcp_sequence = Cookie {
             timestamp: t,
             checksum: csum,
         };
-        let tcp_sequence = tcp_sequence.build_tcp_sequence(); // fits different types in determined number of bytes
+        let tcp_sequence = tcp_sequence.build_tcp_sequence(); // fits different types in a determined number of bytes
 
         printk!("Generated TCP Sequence: %u", tcp_sequence);
         //let (tt, cc) = Cookie::retrive_tcp_sequence(tcp_sequence);
@@ -231,7 +232,7 @@ enum IPProtocol {
 }
 
 impl IPProtocol {
-    fn tcp(&self, ctx: &XdpContext) -> Result<Transport, NetworkError> {
+    fn tcp(&self, ctx: &XdpContext) -> Result<TransportHeader, NetworkError> {
         let tcp_ptr: *const tcphdr = match *self {
             IPProtocol::IPv4(iph) if unsafe { *iph }.protocol == IPPROTO_TCP as u8 => {
                 let addr = unsafe { iph as usize + ((*iph).ihl() * 4) as usize };
@@ -244,7 +245,7 @@ impl IPProtocol {
             _ => return Err(NetworkError::Other),
         };
 
-        Ok(Transport(tcp_ptr as *mut _))
+        Ok(TransportHeader(tcp_ptr as *mut _))
     }
 }
 
