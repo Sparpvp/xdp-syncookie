@@ -12,7 +12,7 @@ const NS_TO_S: u64 = 1000000000;
 fn get_checksum<T: Hash>(to_hash: T) -> u32 {
     let mut hasher = SipHasher::new(); // todo: use better hash
     to_hash.hash(&mut hasher);
-    hasher.finish() as u32
+    (hasher.finish() as u32) & 0xFFFFFF // Masks result for 24 bits
 }
 
 // TODO: Use this to support IPv4 AND IPv6 address in match operation (unaccepted due to different types)
@@ -125,7 +125,7 @@ impl Transport {
                 server_ip: saddr,
                 client_ip: daddr,
             };
-            let checksum = get_checksum(checksum) / 520;
+            let checksum = get_checksum(checksum);
 
             printk!("Hash recomputed: %u | TCP hash: %u", checksum, recv_hash);
 
@@ -175,8 +175,9 @@ impl Cookie {
     fn build_tcp_sequence(&self) -> u32 {
         let mut tcp_seq: u32 = 0;
         tcp_seq = (tcp_seq << 8) | self.timestamp as u32;
-        tcp_seq = (tcp_seq << 24) | (self.checksum / 520);
-        // Note: / 520 is just a rough estimate to fit the biggest u32 into a 24 bits space, should improve this.
+        tcp_seq = (tcp_seq << 24) | (self.checksum);
+        // Note: self.checksum is already masked with 0xFFFFFF from get_checksum function so there's no need
+        // to re-apply the mask.
 
         tcp_seq
     }
@@ -207,7 +208,7 @@ impl Cookie {
             client_port: dest_port,
             timestamp: t,
         };
-        let csum = get_checksum(csum);
+        let csum = get_checksum(csum); // Return hash masked for 24 bits
 
         let tcp_sequence = Cookie {
             timestamp: t,
@@ -217,8 +218,8 @@ impl Cookie {
 
         printk!("Generated TCP Sequence: %u", tcp_sequence);
         //let (tt, cc) = Cookie::retrive_tcp_sequence(tcp_sequence);
-        //assert_eq!(csum / 520, cc); // PASS
-        //printk!("csum g: %u | csum got: %u", csum / 520, cc);
+        //assert_eq!(csum, cc); // PASS
+        //printk!("csum g: %u | csum got: %u", csum, cc);
 
         tcp_sequence
     }
