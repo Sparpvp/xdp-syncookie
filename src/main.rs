@@ -38,6 +38,7 @@ impl Transport {
         unsafe {
             // Send SYN Cookie in SYN-ACK
             let cookie = Cookie::generate_syn_cookie(&ip_proto, tcph);
+            printk!("tcphseq: %u", (*tcph).seq);
             (*tcph).ack_seq = (*tcph).seq + 1;
             (*tcph).seq = cookie;
             (*tcph).set_ack(1);
@@ -47,31 +48,54 @@ impl Transport {
             (*tcph).source = (*tcph).dest;
             (*tcph).dest = temp_s_port;
 
-            // Reverse IP pointer
-            match *ip_proto {
-                IPProtocol::IPv4(ipv4h) => {
-                    let ipv4h = ipv4h as *mut iphdr;
-
-                    let temp_ipv4_saddr = (*ipv4h).saddr;
-                    (*ipv4h).saddr = (*ipv4h).daddr;
-                    (*ipv4h).daddr = temp_ipv4_saddr;
-                }
-                IPProtocol::IPv6(ipv6h) => {
-                    let ipv6h = ipv6h as *mut ipv6hdr;
-
-                    let temp_ipv6_saddr = (*ipv6h).saddr;
-                    (*ipv6h).saddr = (*ipv6h).daddr;
-                    (*ipv6h).daddr = temp_ipv6_saddr;
-                }
-            }
-
             // Reverse Ethernet direction
             let eth_h_source = (*eth_h).h_source;
             (*eth_h).h_source = (*eth_h).h_dest;
             (*eth_h).h_dest = eth_h_source;
 
+            // TCP/IP checksum varies if it's over ipv4 or ipv6
+            match *ip_proto {
+                IPProtocol::IPv4(ipv4h) => {
+                    // Reverse IP pointer
+                    let ipv4h = ipv4h as *mut iphdr;
+                    let temp_ipv4_saddr = (*ipv4h).saddr;
+                    (*ipv4h).saddr = (*ipv4h).daddr;
+                    (*ipv4h).daddr = temp_ipv4_saddr;
+
+                    // Update IP checksum.
+                    (*ipv4h).check = 0;
+                    // More info there: https://www.thegeekstuff.com/2012/05/ip-header-checksum/
+                    // **Ones' complement**(of binary sum of:
+                    // You got to binary sum ALL the IP headers from 0 (version) to 128 (destination address)
+                    // in 16 bits words)
+
+                    // Update TCP checksum.
+                    (*tcph).check = 0;
+                    // More info there: https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_checksum_for_IPv4
+                    // **Ones' complement**(of binary sum of:
+                    // (16bit to 16bit) Entire TCPH, ipsaddr, ipdaddr, 0x0(nullo), 0x06(protocol),
+                    // 0x0000(TCP header + Data length. In two bytes))
+
+                    // let tcp_checksum = 0;
+                    // tcp_checksum += ((*ipv4h).saddr >> 16) + ((*ipv4h).saddr & 0xffff);
+                    // tcp_checksum += ((*ipv4h).daddr >> 16) + ((*ipv4h).daddr & 0xffff);
+                }
+                IPProtocol::IPv6(ipv6h) => {
+                    // Reverse IP pointer
+                    let ipv6h = ipv6h as *mut ipv6hdr;
+                    let temp_ipv6_saddr = (*ipv6h).saddr;
+                    (*ipv6h).saddr = (*ipv6h).daddr;
+                    (*ipv6h).daddr = temp_ipv6_saddr;
+
+                    // IPv6 hasn't got a checksum. So obviously no need to update anything.
+                    // Update TCP checksum
+                    // More info there: https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_checksum_for_IPv6
+                    todo!()
+                }
+            }
+
             /* TODO process_syn:
-                [x] Clear IP options
+                [?] Clear IP options
                 [x] Update IP checksum
                 [x] Update TCP checksum
             */
@@ -152,7 +176,7 @@ impl Cookie {
         let mut tcp_seq: u32 = 0;
         tcp_seq = (tcp_seq << 8) | self.timestamp as u32;
         tcp_seq = (tcp_seq << 24) | (self.checksum / 520);
-        // Note: / 520 is just a rough estimate to fit the biggest u32 into a 24 bits, should improve this.
+        // Note: / 520 is just a rough estimate to fit the biggest u32 into a 24 bits space, should improve this.
 
         tcp_seq
     }
