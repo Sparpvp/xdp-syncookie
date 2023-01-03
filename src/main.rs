@@ -22,6 +22,9 @@ fn get_checksum<T: Hash>(to_hash: T) -> u32 {
 //     IPv6Addr(in6_addr),
 // }
 
+#[repr(align(16))]
+struct AlignedData(Data<XdpContext>);
+
 struct TransportHeader(*mut tcphdr);
 
 impl TransportHeader {
@@ -33,7 +36,7 @@ impl TransportHeader {
         unsafe { *self.0 }.ack() == 1
     }
 
-    fn process_syn(&self, ip_proto: &IPProtocol, eth_h: *mut ethhdr) -> XdpResult {
+    fn process_syn(&self, ip_proto: &IPProtocol, ctx: XdpContext) -> XdpResult {
         let tcph = self.0;
 
         unsafe {
@@ -50,9 +53,10 @@ impl TransportHeader {
             (*tcph).dest = temp_s_port;
 
             // Reverse Ethernet direction
-            let eth_h_source = (*eth_h).h_source;
-            (*eth_h).h_source = (*eth_h).h_dest;
-            (*eth_h).h_dest = eth_h_source;
+            let eth = ctx.eth()? as *mut ethhdr;
+            let eth_h_source = (*eth).h_source;
+            (*eth).h_source = (*eth).h_dest;
+            (*eth).h_dest = eth_h_source;
 
             // TCP/IP checksum varies if it's over ipv4 or ipv6
             match *ip_proto {
@@ -64,22 +68,38 @@ impl TransportHeader {
                     (*ipv4h).daddr = temp_ipv4_saddr;
 
                     // Update IP checksum.
+                    printk!("%x ip original checksum", (*ipv4h).check);
                     (*ipv4h).check = 0;
                     // More info there: https://www.thegeekstuff.com/2012/05/ip-header-checksum/
-                    // **Ones' complement**(of binary sum of:
-                    // You got to binary sum ALL the IP headers from 0 (version) to 128 (destination address)
-                    // in 16 bits words)
+                    // And there: https://en.wikipedia.org/wiki/Internet_checksum#Calculating_the_IPv4_header_checksum
+                    // Ones' complement of binary sum of ALL the IP headers from 0 (version) to 160 (end destination address) in 16 bits words
+                    let iph_bytes: [u16; 10] = core::mem::transmute(*ipv4h);
+                    let mut ip_checksum: u16 = iph_bytes.into_iter().sum();
+                    // This does not take in count carries. Often it'll be 0x2, but it's not always an appropriate value.
+                    let ip_checksum = !ip_checksum; // TODO: Fix the carry
+                    (*ipv4h).check = ip_checksum;
+                    printk!("Computed ip checksum: %x", ip_checksum);
 
+                    printk!("%x tcp original checksum", (*tcph).check);
                     // Update TCP checksum.
                     (*tcph).check = 0;
                     // More info there: https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_checksum_for_IPv4
-                    // **Ones' complement**(of binary sum of:
-                    // (16bit to 16bit) Entire TCPH, ipsaddr, ipdaddr, 0x0(nullo), 0x06(protocol),
-                    // 0x0000(TCP header + Data length. In two bytes))
+                    // Data offset is specified in 32 bit words (QWORDS)
+                    // let tcp_data_offset = (*tcph).doff() * 4;
+                    // let tcp_segment_len = (*ipv4h).tot_len - ((*ipv4h).ihl() * 4) as u16;
+                    // let tcp_data_len = tcp_segment_len - tcp_data_offset;
+                    // let tcp_start = tcph as usize;
+                    // let tcp_end = tcp_start + tcp_data_offset as usize + tcp_data_len as usize;
 
-                    // let tcp_checksum = 0;
-                    // tcp_checksum += ((*ipv4h).saddr >> 16) + ((*ipv4h).saddr & 0xffff);
-                    // tcp_checksum += ((*ipv4h).daddr >> 16) + ((*ipv4h).daddr & 0xffff);
+                    // OFC runtime panic ty redbpf loader
+                    // let align_data = AlignedData(ctx.data()?);
+                    // let ds: &[u16] = core::mem::transmute(align_data.0.slice(align_data.0.len())?);
+                    // let data_checksum: u16 = ds.into_iter().sum();
+                    // let tcp_header_checksum: [u16; 10] = core::mem::transmute(*self.0);
+                    // let tcp_header_checksum: u16 = tcp_header_checksum.into_iter().sum();
+                    // let tcp_segment_checksum: u16 = !(tcp_header_checksum + data_checksum);
+                    // (*tcph).check = tcp_segment_checksum;
+                    // printk!("Computed tcp checksum: %x", tcp_segment_checksum);
                 }
                 IPProtocol::IPv6(ipv6h) => {
                     // Reverse IP pointer
@@ -89,8 +109,7 @@ impl TransportHeader {
                     (*ipv6h).daddr = temp_ipv6_saddr;
 
                     // IPv6 hasn't got a checksum. So obviously no need to update anything.
-                    // Update TCP checksum
-                    // More info there: https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_checksum_for_IPv6
+                    // Update TCP checksum: More info there: https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_checksum_for_IPv6
                     todo!()
                 }
             }
@@ -139,12 +158,9 @@ impl TransportHeader {
         }
     }
 
-    fn handle_tcp(&self, ip_proto: &IPProtocol, eth_h: *mut ethhdr) -> XdpResult {
-        let syn = self.is_syn();
-        //printk!("Syn: %u", syn as u32).unwrap();
-
-        match syn {
-            true => self.process_syn(&ip_proto, eth_h),
+    fn handle_tcp(&self, ip_proto: &IPProtocol, ctx: XdpContext) -> XdpResult {
+        match self.is_syn() {
+            true => self.process_syn(&ip_proto, ctx),
             false if self.is_ack() == true => self.process_ack(&ip_proto),
             _ => Ok(XdpAction::Pass),
         }
@@ -279,9 +295,8 @@ impl TryFrom<&XdpContext> for IPProtocol {
 pub fn xdp_main(ctx: XdpContext) -> XdpResult {
     let ip_proto = IPProtocol::try_from(&ctx)?;
     let tcp = ip_proto.tcp(&ctx)?;
-    let eth = ctx.eth()? as *mut ethhdr;
 
-    let XdpState = tcp.handle_tcp(&ip_proto, eth);
+    let XdpState = tcp.handle_tcp(&ip_proto, ctx);
 
     match &XdpState {
         Ok(XdpAction::Pass) => {
