@@ -68,22 +68,28 @@ impl TransportHeader {
                     (*ipv4h).daddr = temp_ipv4_saddr;
 
                     // Update IP checksum.
-                    printk!("%x ip original checksum", (*ipv4h).check);
-                    (*ipv4h).check = 0;
                     // More info there: https://www.thegeekstuff.com/2012/05/ip-header-checksum/
                     // And there: https://en.wikipedia.org/wiki/Internet_checksum#Calculating_the_IPv4_header_checksum
                     // Ones' complement of binary sum of ALL the IP headers from 0 (version) to 160 (end destination address) in 16 bits words
+                    // printk!("%x ip original checksum", (*ipv4h).check);
+                    (*ipv4h).check = 0;
                     let iph_bytes: [u16; 10] = core::mem::transmute(*ipv4h);
-                    let mut ip_checksum: u16 = iph_bytes.into_iter().sum();
-                    // This does not take in count carries. Often it'll be 0x2, but it's not always an appropriate value.
-                    let ip_checksum = !ip_checksum; // TODO: Fix the carry
+                    let mut ip_checksum: u32 = 0;
+                    iph_bytes.into_iter().for_each(|x| {
+                        ip_checksum += *x as u32;
+                    });
+                    while ip_checksum > 65535 {
+                        ip_checksum -= 65535
+                    }
+                    let ip_checksum = !ip_checksum as u16;
                     (*ipv4h).check = ip_checksum;
+
                     printk!("Computed ip checksum: %x", ip_checksum);
 
-                    printk!("%x tcp original checksum", (*tcph).check);
+                    //printk!("%x tcp original checksum", (*tcph).check);
                     // Update TCP checksum.
-                    (*tcph).check = 0;
                     // More info there: https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_checksum_for_IPv4
+                    (*tcph).check = 0;
                     // Data offset is specified in 32 bit words (QWORDS)
                     // let tcp_data_offset = (*tcph).doff() * 4;
                     // let tcp_segment_len = (*ipv4h).tot_len - ((*ipv4h).ihl() * 4) as u16;
